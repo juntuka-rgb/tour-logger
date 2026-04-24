@@ -18,7 +18,8 @@ if menu == "実績ログ記録 (Tour Logger)":
     # app_daily_log.py を実行
     if os.path.exists("app_daily_log.py"):
         with open("app_daily_log.py", encoding="utf-8") as f:
-            exec(f.read())
+# 4/24 修正しました。
+            exec(f.read(), globals())
     else:
         st.error("app_daily_log.py が見つかりません。")
 
