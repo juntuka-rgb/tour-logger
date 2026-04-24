@@ -4,3 +4,5 @@ pydeck
 google-auth
 gspread
 fitparse
+folium
+streamlit-folium
