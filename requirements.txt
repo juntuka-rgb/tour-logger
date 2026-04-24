@@ -6,3 +6,4 @@ gspread
 fitparse
 folium
 streamlit-folium
+plotly
