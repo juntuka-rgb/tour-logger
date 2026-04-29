@@ -6,6 +6,10 @@ st.set_page_config(page_title="Tour Navigator Portal", layout="wide")
 
 st.title("🚴‍♂️ Tour Navigator: 旅の司令塔")
 
+# Initialize st.session_state for data persistence
+if 'fit_coordinates' not in st.session_state:
+    st.session_state['fit_coordinates'] = None
+
 # 2. サイドバーで機能を選択
 menu = st.sidebar.selectbox(
     "機能を選択してください",
@@ -18,7 +22,6 @@ if menu == "実績ログ記録 (Tour Logger)":
     # app_daily_log.py を実行
     if os.path.exists("app_daily_log.py"):
         with open("app_daily_log.py", encoding="utf-8") as f:
-# 4/24 修正しました。
             exec(f.read(), globals())
     else:
         st.error("app_daily_log.py が見つかりません。")
@@ -63,3 +66,11 @@ elif menu == "ルート計画 (Route Builder)":
     
     st.write("")
     st.info("※クリックすると新しいタブでルート・ビルダーが開きます。")
+
+# スプレッドシートの最新データを常に参照
+try:
+    ss = common.connect()
+    sheet_tour = ss.worksheet("旅の記録")
+    sheet_total = ss.worksheet("全行程CSV")
+except Exception as e:
+    st.error(f"スプレッドシート接続エラー: {e}")

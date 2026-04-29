@@ -8,6 +8,7 @@ from datetime import datetime
 import pytz
 import math
 import io
+import json
 
 # ========== セッション状態初期化 ==========
 if 'loaded_paths' not in st.session_state:
@@ -20,6 +21,8 @@ if 'occupy_mode' not in st.session_state:
     st.session_state.occupy_mode = False
 if 'total_save_date' not in st.session_state:
     st.session_state.total_save_date = datetime.now(pytz.timezone('Asia/Tokyo')).date()
+if 'view_state' not in st.session_state:
+    st.session_state.view_state = {'latitude': 35.68, 'longitude': 139.76, 'zoom': 10}
 
 # ========== スプレッドシート接続 ==========
 try:
@@ -45,6 +48,7 @@ def create_occupy_polygon(points):
     return lower[:-1] + upper[:-1]
 
 def adaptive_sample_points(points):
+    if not points: return []
     n = len(points)
     if n < 5000: step = max(1, n // 1000)
     elif n < 20000: step = max(1, n // 500)
@@ -55,7 +59,8 @@ def slim_format_points(all_paths):
     day_strings = []
     for path in all_paths:
         if path:
-            pts_str = ";".join([f"{round(p[0], 6)},{round(p[1], 6)}" for p in path])
+            # 5万文字制限対策：保存時に小数点を5桁に丸めてダイエット
+            pts_str = ";".join([f"{round(p[0], 5)},{round(p[1], 5)}" for p in path])
             day_strings.append(pts_str)
     return "|".join(day_strings)
 
@@ -76,150 +81,140 @@ def calculate_auto_zoom(latitudes, longitudes):
     else: zoom = 9
     return center_lat, center_lon, zoom
 
-# 🚩 修正箇所1：セパレーター"|"で分解して、日ごとのリストのリストを返す
-def load_latest_route_from_sheet():
-    if sheet_total is None: return [], None
+# 🚩 初期表示：累計と当日データの読み込み
+def load_routes():
+    cumulative_paths = []
+    today_path = []
+
+    # 累計データ（青い線）を読み込む
     try:
-        all_data = sheet_total.get_all_values()
-        if len(all_data) < 2: return [], None
-        date_row = all_data[0]
-        for col_idx in range(len(date_row) - 1, -1, -1):
-            val = date_row[col_idx].strip()
-            if val:
-                all_paths_reconstructed = []
-                # "|" で日ごとにバラす
-                segments = all_data[1][col_idx].split("|")
-                for seg in segments:
-                    day_pts = []
-                    for coord in seg.split(";"):
-                        if coord.strip():
-                            day_pts.append(list(map(float, coord.split(","))))
-                    if day_pts:
-                        all_paths_reconstructed.append(day_pts)
-                return all_paths_reconstructed, datetime.strptime(val, '%Y/%m/%d')
-        return [], None
-    except: return [], None
+        last_col = len(sheet_total.row_values(1))
+        if last_col > 0:
+            cumulative_data = sheet_total.cell(2, last_col).value
+            if cumulative_data:
+                cumulative_paths = [
+                    [[float(coord.split(",")[0]), float(coord.split(",")[1])] for coord in segment.split(";") if "," in coord]
+                    for segment in cumulative_data.split("|") if segment.strip()
+                ]
+    except Exception as e:
+        st.warning(f"累計データの読み込み中にエラーが発生しました: {e}")
 
-# 🚩 修正箇所2：読み込んだ「リストのリスト」を正しくセッションに格納
-if sheet_total is not None and not st.session_state.loaded_paths:
-    paths_list, d = load_latest_route_from_sheet()
-    if paths_list:
-        st.session_state.loaded_paths = paths_list
-        # 統計用にフラットな地点リストも作る
-        st.session_state.loaded_points = [p for path in paths_list for p in path]
-        st.session_state.loaded_date = d
+    # 当日データ（赤い線）を読み込む
+    try:
+        sheet_tour = ss.worksheet("旅の記録")
+        t_last_col = len(sheet_tour.row_values(1))
+        if t_last_col > 0:
+            today_data_json = sheet_tour.cell(12, t_last_col).value
+            if today_data_json:
+                today_data = json.loads(today_data_json)
+                today_path = [[lon, lat] for lon, lat in zip(today_data['longitudes'], today_data['latitudes'])]
+    except Exception as e:
+        st.warning(f"当日データの読み込み中にエラーが発生しました: {e}")
 
-# ========== データ処理 ==========
-all_paths = st.session_state.loaded_paths.copy()
-all_combined = st.session_state.loaded_points.copy()
+    return cumulative_paths, today_path
 
+# 初期データ実行
+cumulative_paths, today_path = load_routes()
+
+# ========== 地図の描画 ==========
+def render_map(cumulative_paths, today_path):
+    layers = []
+    all_coords = []
+
+    # 累計データ（青い線）
+    if cumulative_paths:
+        layers.append(pdk.Layer(
+            "PathLayer",
+            data=pd.DataFrame({'path': cumulative_paths}),
+            get_path='path',
+            get_color=[0, 0, 255, 200],
+            width_min_pixels=3
+        ))
+        for p in cumulative_paths: all_coords.extend(p)
+
+    # 当日データ（赤い線）
+    if today_path:
+        layers.append(pdk.Layer(
+            "PathLayer",
+            data=pd.DataFrame({'path': [today_path]}),
+            get_path='path',
+            get_color=[255, 0, 0, 255],
+            get_width=5,
+            width_min_pixels=3
+        ))
+        all_coords.extend(today_path)
+
+    # ズームの自動調整
+    if all_coords:
+        lats = [c[1] for c in all_coords]; lons = [c[0] for c in all_coords]
+        clat, clon, zoom = calculate_auto_zoom(lats, lons)
+        st.session_state.view_state = {'latitude': clat, 'longitude': clon, 'zoom': zoom}
+
+    st.pydeck_chart(pdk.Deck(
+        layers=layers,
+        initial_view_state=pdk.ViewState(
+            latitude=st.session_state.view_state['latitude'],
+            longitude=st.session_state.view_state['longitude'],
+            zoom=st.session_state.view_state['zoom']
+        ),
+        map_style='light'
+    ))
+
+render_map(cumulative_paths, today_path)
+
+# ========== 手動連結：FITファイルアップロード ==========
 uploaded_files = st.file_uploader("新しいFITファイルを選択して連結してください", type=["fit"], accept_multiple_files=True)
 if uploaded_files:
-    file_info = []
+    all_manual = []
     for f in uploaded_files:
         try:
-            raw_bytes = f.getvalue()
-            fit_data = io.BytesIO(raw_bytes)
-            fit = FitFile(fit_data)
-            first_msg = next(fit.get_messages('record'))
-            first_ts = first_msg.get_values().get('timestamp')
-            file_info.append((first_ts, raw_bytes))
+            fit = FitFile(io.BytesIO(f.getvalue()))
+            file_pts = []
+            for r in fit.get_messages('record'):
+                v = r.get_values()
+                if 'position_lat' in v:
+                    file_pts.append([v['position_long'] * (180.0/2**31), v['position_lat'] * (180.0/2**31)])
+            if file_pts:
+                all_manual.extend(file_pts)
         except Exception as e:
-            file_info.append((f.name, f.getvalue()))
-    
-    file_info.sort(key=lambda x: x[0])
+            st.error(f"FITファイルの処理中にエラーが発生しました: {e}")
 
-    if file_info:
-        tokyo_tz = pytz.timezone('Asia/Tokyo')
-        latest_ts = file_info[-1][0]
-        if isinstance(latest_ts, datetime):
-            st.session_state.total_save_date = latest_ts.replace(tzinfo=pytz.utc).astimezone(tokyo_tz).date()
+    if all_manual:
+        # 手動アップロード時は、赤い線を上書き
+        today_path = adaptive_sample_points(all_manual)
+        st.info("💡 手動アップロードされたデータで当日分を上書きしました。")
+        render_map(cumulative_paths, today_path)
 
-    for ts, raw_b in file_info:
-        fit = FitFile(io.BytesIO(raw_b))
-        file_pts = []
-        for r in fit.get_messages('record'):
-            v = r.get_values()
-            if 'position_lat' in v:
-                file_pts.append([v['position_long'] * (180.0/2**31), v['position_lat'] * (180.0/2**31)])
-        if file_pts:
-            smp = adaptive_sample_points(file_pts)
-            all_paths.append(smp)
-            all_combined.extend(smp)
-
-# ========== 軌跡表示セクション ==========
-st.subheader("🗺️ 軌跡表示")
-
-if all_combined:
-    c1, c2, c3 = st.columns(3)
-    with c1: st.metric("📍 ロード済み", len(st.session_state.loaded_points))
-    with c2: 
-        new_pts = len(all_combined) - len(st.session_state.loaded_points)
-        st.metric("🆕 新規地点", new_pts)
-    with c3: st.metric("📊 合計地点", len(all_combined))
-
-    lats = [p[1] for p in all_combined]; lons = [p[0] for p in all_combined]
-    clat, clon, zoom = calculate_auto_zoom(lats, lons)
-
-    # 🚩 修正箇所3：[all_paths]ではなく、すでにリストのリストであるall_pathsをそのまま使う
-    layers = [pdk.Layer('PathLayer', pd.DataFrame({'path': [p for p in all_paths if p]}),
-                        get_path='path', get_color=[255, 0, 0, 255], get_width=10, width_min_pixels=3)]
-    
-    st_p, en_p = all_combined[0], all_combined[-1]
-    layers.append(pdk.Layer('ScatterplotLayer', pd.DataFrame([
-        {'lon': st_p[0], 'lat': st_p[1], 'color': [0, 204, 0]},
-        {'lon': en_p[0], 'lat': en_p[1], 'color': [255, 0, 0]}
-    ]), get_position=['lon', 'lat'], get_radius=800, get_fill_color='color', radiusMinPixels=8))
-
-    if st.session_state.occupy_mode:
-        poly = create_occupy_polygon(all_combined)
-        if poly: layers.append(pdk.Layer('PolygonLayer', pd.DataFrame({'polygon': [[poly]]}),
-                                        get_polygon='polygon', get_fill_color=[255, 102, 102, 100], filled=True))
-
-    st.pydeck_chart(pdk.Deck(layers=layers, initial_view_state=pdk.ViewState(latitude=clat, longitude=clon, zoom=zoom),
-                             map_style='light'), use_container_width=True, key=f"map-{len(all_combined)}")
-else:
-    st.info("📥 クラウドからロード待機中、またはFITをアップロードしてください。")
-
+# ========== 保存：クラウドに保存 ==========
 st.divider()
-st.subheader("### 🎮 Occupy Project")
+if st.button("📤 更新", use_container_width=True):
+    if not today_path and not cumulative_paths:
+        st.error("保存するデータがありません。")
+    else:
+        try:
+            with st.spinner("データを軽量化してスプレッドシートへ保存中..."):
+                target_col = len(sheet_total.row_values(1)) + 1
+                
+                # 1. 保存直前にすべてのパスを「間引き」ロジックに通す
+                thinned_cumulative = [adaptive_sample_points(p) for p in cumulative_paths]
+                thinned_today = adaptive_sample_points(today_path)
+                
+                # 2. 連結
+                final_paths = thinned_cumulative + ([thinned_today] if thinned_today else [])
+                
+                # 3. 文字列化（ここで小数点5桁への丸めが実行されます）
+                combined_data = slim_format_points(final_paths)
 
-if not st.session_state.occupy_mode:
-    if st.button("🚩 Occupy Tokyo Bay! (このエリアを占拠する)", use_container_width=True):
-        st.session_state.occupy_mode = True
-        st.balloons()
-        st.rerun()
-else:
-    st.success("✨ **占拠中...** ✨")
-    if st.button("🔄 占拠を解除", use_container_width=True):
-        st.session_state.occupy_mode = False
-        st.rerun()
-
-st.divider()
-st.subheader("💾 クラウドに保存")
-if all_combined:
-    st.caption(f"📍 {len(all_combined)} 地点をスプレッドシートに保存します")
-    
-    col_date, col_btn = st.columns([3, 1])
-    with col_date:
-        update_date = st.date_input("保存日付を選択", value=st.session_state.total_save_date)
-    
-    with col_btn:
-        st.write("") 
-        st.write("")
-        if st.button("📤 更新", use_container_width=True):
-            try:
-                h = sheet_total.row_values(1)
-                num_existing_cols = len(h)
-                sheet_total.add_cols(1)
-                target_col = num_existing_cols + 1
-                
-                d_str = update_date.strftime('%Y/%m/%d')
-                slim = slim_format_points(all_paths)
-                
-                sheet_total.update_cell(1, target_col, d_str)
-                sheet_total.update_cell(2, target_col, slim)
-                
-                st.balloons(); st.success(f"✅ {d_str} を保存完了！")
-            except Exception as e:
-                st.error(f"保存失敗: {e}")
+                # 4. 5万文字制限の最終チェック
+                if len(combined_data) > 49000:
+                    st.error(f"❌ データ量が多すぎます ({len(combined_data)}文字)。これ以上の保存は分割が必要です。")
+                else:
+                    save_date = datetime.now(pytz.timezone('Asia/Tokyo')).strftime('%Y/%m/%d')
+                    sheet_total.add_cols(1)
+                    sheet_total.update_cell(1, target_col, save_date)
+                    sheet_total.update_cell(2, target_col, combined_data)
+                    
+                    st.success(f"✅ {save_date} のデータを {target_col}列目に保存しました！")
+                    st.balloons()
+        except Exception as e:
+            st.error(f"保存中にエラーが発生しました: {e}")
